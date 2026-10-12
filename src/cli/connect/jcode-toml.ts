@@ -1,6 +1,8 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+import { writeTextAtomic } from "./util.js";
 
 // jcode's [hooks] section keys are TOML arrays of command strings. Other
 // keys in the file (provider config, display prefs, …) must survive any
@@ -27,12 +29,66 @@ function sectionBounds(src: string, section: string): { start: number; end: numb
   return { start, end };
 }
 
+const BASIC_UNESCAPES: Record<string, string> = {
+  b: "\b",
+  t: "\t",
+  n: "\n",
+  f: "\f",
+  r: "\r",
+  '"': '"',
+  "\\": "\\",
+};
+
+/** Serialize as a TOML basic string; symmetric with unescapeTomlString. */
 export function escapeTomlString(v: string): string {
-  return `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  let out = "";
+  for (const ch of v) {
+    switch (ch) {
+      case "\\":
+        out += "\\\\";
+        continue;
+      case '"':
+        out += '\\"';
+        continue;
+      case "\b":
+        out += "\\b";
+        continue;
+      case "\t":
+        out += "\\t";
+        continue;
+      case "\n":
+        out += "\\n";
+        continue;
+      case "\f":
+        out += "\\f";
+        continue;
+      case "\r":
+        out += "\\r";
+        continue;
+    }
+    const cp = ch.codePointAt(0)!;
+    if (cp < 0x20 || cp === 0x7f) {
+      out += `\\u${cp.toString(16).padStart(4, "0")}`;
+    } else if (cp > 0xffff) {
+      out += `\\U${cp.toString(16).padStart(8, "0")}`;
+    } else {
+      out += ch;
+    }
+  }
+  return `"${out}"`;
 }
 
 function unescapeTomlString(v: string): string {
-  return v.replace(/\\(["\\])/g, "$1");
+  return v.replace(
+    /\\(b|t|n|f|r|"|\\|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})/g,
+    (m, g: string) => {
+      const c = g[0]!;
+      if (c === "u" || c === "U") {
+        return String.fromCodePoint(parseInt(g.slice(1), 16));
+      }
+      return BASIC_UNESCAPES[g] ?? m;
+    },
+  );
 }
 
 /** The exact command string installed for a hook key; uninstall matches it. */
@@ -53,6 +109,7 @@ function scanValueEnd(src: string, pos: number): number {
     throw new Error("agentmemory: multiline TOML strings are not supported in [hooks]");
   }
   if (src[i] === '"') return scanBasicString(src, i);
+  if (src[i] === "'") return scanLiteralString(src, i);
   if (src[i] === "[") return scanArray(src, i);
   const nl = src.indexOf("\n", i);
   const lineEnd = nl === -1 ? src.length : nl;
@@ -74,23 +131,40 @@ function scanBasicString(src: string, start: number): number {
   throw new Error("agentmemory: unterminated TOML string in [hooks]");
 }
 
+function scanLiteralString(src: string, start: number): number {
+  const end = src.indexOf("'", start + 1);
+  const nl = src.indexOf("\n", start);
+  if (end === -1 || (nl !== -1 && nl < end)) {
+    throw new Error("agentmemory: unterminated TOML literal string in [hooks]");
+  }
+  return end + 1;
+}
+
 function scanArray(src: string, start: number): number {
   let depth = 0;
   let i = start;
-  let inString = false;
+  let quote: '"' | "'" | null = null;
   while (i < src.length) {
     const c = src[i];
-    if (inString) {
+    if (quote === '"') {
       if (c === "\\") {
         i += 2;
         continue;
       }
-      if (c === '"') inString = false;
+      if (c === '"') quote = null;
       i++;
       continue;
     }
-    if (c === '"') {
-      inString = true;
+    if (quote === "'") {
+      if (c === "'") quote = null;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      if (src.startsWith(c === '"' ? '"""' : "'''", i)) {
+        throw new Error("agentmemory: multiline TOML strings are not supported in [hooks]");
+      }
+      quote = c as '"' | "'";
       i++;
       continue;
     }
@@ -125,28 +199,44 @@ function findKeySpan(text: string, key: string): { start: number; end: number; r
   return { start: m.index, end: valueEnd, raw: text.slice(m.index + m[0].length, valueEnd) };
 }
 
+/** Unquote a TOML scalar: literal strings strip only, basic strings unescape. */
+function unquoteTomlScalar(p: string): string {
+  if (p.length >= 2 && p.startsWith("'") && p.endsWith("'")) return p.slice(1, -1);
+  if (p.length >= 2 && p.startsWith('"') && p.endsWith('"')) return unescapeTomlString(p.slice(1, -1));
+  return p;
+}
+
 /** Split an array literal's inner text on commas outside quotes, dropping comments. */
 function splitTomlArray(raw: string): string[] {
   const inner = raw.slice(1, -1);
   const parts: string[] = [];
   let cur = "";
-  let inString = false;
+  let quote: '"' | "'" | null = null;
   let i = 0;
   while (i < inner.length) {
     const c = inner[i];
-    if (inString) {
+    if (quote === '"') {
       cur += c;
       if (c === "\\" && i + 1 < inner.length) {
-        cur += inner[i + 1];
+        cur += inner[i + 1]!;
         i += 2;
         continue;
       }
-      if (c === '"') inString = false;
+      if (c === '"') quote = null;
       i++;
       continue;
     }
-    if (c === '"') {
-      inString = true;
+    if (quote === "'") {
+      cur += c;
+      if (c === "'") quote = null;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      if (inner.startsWith(c === '"' ? '"""' : "'''", i)) {
+        throw new Error("agentmemory: multiline TOML strings are not supported in [hooks]");
+      }
+      quote = c as '"' | "'";
       cur += c;
       i++;
       continue;
@@ -170,19 +260,30 @@ function splitTomlArray(raw: string): string[] {
   return parts
     .map((p) => p.trim())
     .filter((p) => p.length > 0)
-    .map((p) =>
-      p.startsWith('"') && p.endsWith('"') && p.length >= 2 ? unescapeTomlString(p.slice(1, -1)) : p,
-    );
+    .map(unquoteTomlScalar);
 }
 
 /** Parse a complete TOML value: array (any layout) or scalar. */
 function parseTomlValue(raw: string): string[] {
   const cur = raw.trim();
   if (cur.startsWith("[")) return splitTomlArray(cur);
-  if (cur.startsWith('"') && cur.endsWith('"') && cur.length >= 2) {
-    return [unescapeTomlString(cur.slice(1, -1))];
-  }
-  return [cur];
+  return [unquoteTomlScalar(cur)];
+}
+
+/** Read-only check used for backup decisions and post-write verification. */
+export function tomlArrayContains(
+  configPath: string,
+  section: string,
+  key: string,
+  value: string,
+): boolean {
+  const src = readConfig(configPath);
+  const bounds = sectionBounds(src, section);
+  if (!bounds) return false;
+  const body = src.slice(bounds.start, bounds.end);
+  const span = findKeySpan(body, key);
+  if (!span) return false;
+  return parseTomlValue(span.raw).includes(value);
 }
 
 /**
@@ -228,7 +329,7 @@ export function upsertTomlArrayValue(
     const joined = values.concat(command).map((v) => escapeTomlString(v)).join(", ");
     const newAfter =
       afterHeader.slice(0, span.start) + `${key} = [${joined}]` + afterHeader.slice(span.end);
-    writeFileSync(configPath, head + body.slice(0, headerLen) + newAfter + tail);
+    writeTextAtomic(configPath, head + body.slice(0, headerLen) + newAfter + tail);
     return "written";
   }
 
@@ -236,7 +337,7 @@ export function upsertTomlArrayValue(
   const out = bounds
     ? head + body.slice(0, headerLen) + newAfter + tail
     : head + `[${section}]\n` + newAfter;
-  writeFileSync(configPath, out);
+  writeTextAtomic(configPath, out);
   return "written";
 }
 
@@ -267,7 +368,7 @@ export function removeTomlArrayValue(
   const skipLen = replacement === "" && lineRemainder ? lineRemainder[0].length : 0;
   let newBody = body.slice(0, span.start) + replacement + rest.slice(skipLen);
   newBody = newBody.replace(/\n{3,}/g, "\n\n");
-  writeFileSync(configPath, src.slice(0, bounds.start) + newBody + src.slice(bounds.end));
+  writeTextAtomic(configPath, src.slice(0, bounds.start) + newBody + src.slice(bounds.end));
 }
 
 /** Read the user's existing mcp.json, or an empty wrapper object. */
@@ -284,7 +385,7 @@ export function writeJcodeMcpJson(
   data: unknown,
   jcodeDir = join(homedir(), ".jcode"),
 ): void {
-  writeFileSync(join(jcodeDir, "mcp.json"), JSON.stringify(data, null, 2) + "\n");
+  writeTextAtomic(join(jcodeDir, "mcp.json"), JSON.stringify(data, null, 2) + "\n");
 }
 
 export function jcodeConfigPath(jcodeDir = join(homedir(), ".jcode")): string {

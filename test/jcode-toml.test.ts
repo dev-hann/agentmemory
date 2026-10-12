@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   escapeTomlString,
   removeTomlArrayValue,
+  tomlArrayContains,
   tomlHookCommand,
   upsertTomlArrayValue,
 } from "../src/cli/connect/jcode-toml.js";
@@ -126,6 +127,75 @@ describe("jcode-toml upsertTomlArrayValue", () => {
     expect(out).toContain('post_tool_extra = ["keep"]');
     expect(out.split("\n").filter((l) => l.includes("post_tool")).length).toBe(2);
   });
+
+  it("unquotes literal-string entries instead of keeping the quotes", () => {
+    const p = setup("[hooks]\npost_tool = ['other-tool']\n");
+    upsertTomlArrayValue(p, "hooks", "post_tool", tomlHookCommand("/bridge.mjs", "post_tool"));
+    const line = readFileSync(p, "utf8").split("\n").find((l) => l.startsWith("post_tool"));
+    expect(line).toBe(`post_tool = ["other-tool", ${escapeTomlString(tomlHookCommand("/bridge.mjs", "post_tool"))}]`);
+  });
+
+  it("promotes a literal-string scalar without adding quotes to the value", () => {
+    const p = setup("[hooks]\nsession_start = 'legacy-hook'\n");
+    upsertTomlArrayValue(p, "hooks", "session_start", tomlHookCommand("/bridge.mjs", "session_start"));
+    const line = readFileSync(p, "utf8").split("\n").find((l) => l.startsWith("session_start"));
+    expect(line).toBe(`session_start = ["legacy-hook", ${escapeTomlString(tomlHookCommand("/bridge.mjs", "session_start"))}]`);
+  });
+
+  it("treats brackets and hashes inside literal strings as plain characters", () => {
+    const p = setup("[hooks]\npost_tool = ['a]b', 'x # y']\n");
+    upsertTomlArrayValue(p, "hooks", "post_tool", tomlHookCommand("/bridge.mjs", "post_tool"));
+    expect(upsertTomlArrayValue(p, "hooks", "post_tool", tomlHookCommand("/bridge.mjs", "post_tool"))).toBe("skipped");
+    const line = readFileSync(p, "utf8").split("\n").find((l) => l.startsWith("post_tool"));
+    expect(line).toBe(`post_tool = ["a]b", "x # y", ${escapeTomlString(tomlHookCommand("/bridge.mjs", "post_tool"))}]`);
+  });
+
+  it("treats brackets and hashes inside basic strings as plain characters", () => {
+    const p = setup('[hooks]\npost_tool = ["a]b", "x # y"]\n');
+    upsertTomlArrayValue(p, "hooks", "post_tool", tomlHookCommand("/bridge.mjs", "post_tool"));
+    const line = readFileSync(p, "utf8").split("\n").find((l) => l.startsWith("post_tool"));
+    expect(line).toBe(`post_tool = ["a]b", "x # y", ${escapeTomlString(tomlHookCommand("/bridge.mjs", "post_tool"))}]`);
+  });
+
+  it("keeps existing escape sequences stable across re-runs", () => {
+    const p = setup('[hooks]\npost_tool = ["old\\twith tab"]\n');
+    upsertTomlArrayValue(p, "hooks", "post_tool", tomlHookCommand("/bridge.mjs", "post_tool"));
+    const once = readFileSync(p, "utf8");
+    expect(once).toContain('"old\\twith tab"');
+    expect(upsertTomlArrayValue(p, "hooks", "post_tool", tomlHookCommand("/bridge.mjs", "post_tool"))).toBe("skipped");
+    expect(readFileSync(p, "utf8")).toBe(once);
+  });
+
+  it("round-trips control characters and non-ASCII without mutation", () => {
+    const p = setup("[hooks]\n");
+    const cmd = "echo héllo\tworld";
+    upsertTomlArrayValue(p, "hooks", "post_tool", cmd);
+    const line = readFileSync(p, "utf8").split("\n").find((l) => l.startsWith("post_tool"));
+    expect(line).toBe('post_tool = ["echo héllo\\tworld"]');
+    expect(upsertTomlArrayValue(p, "hooks", "post_tool", cmd)).toBe("skipped");
+  });
+
+  it("decodes unicode escapes and keeps them stable", () => {
+    const p = setup('[hooks]\npost_tool = ["caf\\u00e9"]\n');
+    upsertTomlArrayValue(p, "hooks", "post_tool", tomlHookCommand("/bridge.mjs", "post_tool"));
+    const line = readFileSync(p, "utf8").split("\n").find((l) => l.startsWith("post_tool"));
+    expect(line).toBe(`post_tool = ["café", ${escapeTomlString(tomlHookCommand("/bridge.mjs", "post_tool"))}]`);
+    expect(upsertTomlArrayValue(p, "hooks", "post_tool", tomlHookCommand("/bridge.mjs", "post_tool"))).toBe("skipped");
+  });
+
+  it("throws without writing on multiline strings", () => {
+    const p = setup('[hooks]\npost_tool = ["""x"""]\n');
+    const before = readFileSync(p, "utf8");
+    expect(() => upsertTomlArrayValue(p, "hooks", "post_tool", "x")).toThrow();
+    expect(readFileSync(p, "utf8")).toBe(before);
+  });
+
+  it("throws without writing on unterminated literal strings", () => {
+    const p = setup("[hooks]\npost_tool = ['oops\n");
+    const before = readFileSync(p, "utf8");
+    expect(() => upsertTomlArrayValue(p, "hooks", "post_tool", "x")).toThrow();
+    expect(readFileSync(p, "utf8")).toBe(before);
+  });
 });
 
 describe("jcode-toml removeTomlArrayValue", () => {
@@ -166,6 +236,26 @@ describe("jcode-toml removeTomlArrayValue", () => {
     upsertTomlArrayValue(p, "hooks", "post_tool", cmd);
     removeTomlArrayValue(p, "hooks", "post_tool", cmd);
     expect(readFileSync(p, "utf8")).toBe("[hooks]\n");
+  });
+
+  it("removes entries that were originally literal strings", () => {
+    const p = setup("[hooks]\npost_tool = ['a]b', 'x # y']\n");
+    removeTomlArrayValue(p, "hooks", "post_tool", "a]b");
+    expect(readFileSync(p, "utf8")).toBe('[hooks]\npost_tool = ["x # y"]\n');
+  });
+});
+
+describe("jcode-toml tomlArrayContains", () => {
+  it("detects values in multiline, literal, and escaped arrays", () => {
+    const p = setup(["[hooks]", "post_tool = [", "  'lit',", '  "esc\\ttab",', "]", ""].join("\n"));
+    expect(tomlArrayContains(p, "hooks", "post_tool", "lit")).toBe(true);
+    expect(tomlArrayContains(p, "hooks", "post_tool", "esc\ttab")).toBe(true);
+    expect(tomlArrayContains(p, "hooks", "post_tool", "absent")).toBe(false);
+  });
+
+  it("returns false when the section or key is absent", () => {
+    const p = setup("[provider]\nmodel = \"x\"\n");
+    expect(tomlArrayContains(p, "hooks", "post_tool", "x")).toBe(false);
   });
 });
 

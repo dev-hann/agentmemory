@@ -3,10 +3,12 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
+import { backupFile, logBackup } from "./util.js";
 import {
   jcodeConfigPath,
   readJcodeMcpJson,
   removeTomlArrayValue,
+  tomlArrayContains,
   tomlHookCommand,
   upsertTomlArrayValue,
   writeJcodeMcpJson,
@@ -188,12 +190,30 @@ export const adapter: ConnectAdapter = {
       );
     }
 
-    // 3) TOML hooks — each key installs with its event argument.
+    // 3) TOML hooks — each key installs with its event argument. The
+    // user's config is backed up before the first real mutation
+    // (same convention as the codex/claude-code adapters).
+    const hookCmd = (key: string) => tomlHookCommand(bridgeCmd, key);
+    const needsTomlWrite = HOOK_KEYS.some(
+      (key) => !tomlArrayContains(configPath, "hooks", key, hookCmd(key)),
+    );
+    if (needsTomlWrite && existsSync(configPath)) {
+      logBackup(backupFile(configPath, "jcode", "toml"));
+    }
     let tomlMutated = false;
     for (const key of HOOK_KEYS) {
-      if (upsertTomlArrayValue(configPath, "hooks", key, tomlHookCommand(bridgeCmd, key)) === "written") {
+      if (upsertTomlArrayValue(configPath, "hooks", key, hookCmd(key)) === "written") {
         tomlMutated = true;
       }
+    }
+    const wired = HOOK_KEYS.every((key) =>
+      tomlArrayContains(configPath, "hooks", key, hookCmd(key)),
+    );
+    if (!wired) {
+      console.error(
+        `[agentmemory] verification failed: ${configPath} does not contain all agentmemory hooks after write`,
+      );
+      return { kind: "skipped", reason: "verification-failed" };
     }
 
     if (!mcpMutated && !tomlMutated) {
@@ -207,8 +227,16 @@ export const adapter: ConnectAdapter = {
 // mcp.json/mcpServers.agentmemory removal — kept out of the adapter so
 // `connect` stays single-purpose (upstream convention: adapters install).
 export function uninstallJcode(): void {
+  const configPath = jcodeConfigPath();
+  const hookCmd = (key: string) => tomlHookCommand(join(PLUGIN_DIR, BRIDGE_SCRIPT), key);
+  if (
+    existsSync(configPath) &&
+    HOOK_KEYS.some((key) => tomlArrayContains(configPath, "hooks", key, hookCmd(key)))
+  ) {
+    logBackup(backupFile(configPath, "jcode", "toml"));
+  }
   for (const key of HOOK_KEYS) {
-    removeTomlArrayValue(jcodeConfigPath(), "hooks", key, tomlHookCommand(join(PLUGIN_DIR, BRIDGE_SCRIPT), key));
+    removeTomlArrayValue(configPath, "hooks", key, hookCmd(key));
   }
   const mcp = readJcodeMcpJson();
   const servers = (mcp.mcpServers as Record<string, unknown>) ?? {};
