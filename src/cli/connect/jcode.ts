@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
@@ -14,12 +14,31 @@ import {
 // (~/.jcode/config.toml [hooks]) that translate jcode's JCODE_HOOK_* env
 // vars into the Claude-style stdin JSON the bundled hooks read. The bridge
 // script is a small static shim — no build step — installed into
-// ~/.jcode/plugins/agentmemory/.
+// ~/.jcode/plugins/agentmemory/ alongside copies of the bundled hook
+// scripts it spawns.
 
 const JCODE_DIR = join(homedir(), ".jcode");
 const PLUGIN_DIR = join(JCODE_DIR, "plugins", "agentmemory");
 const BRIDGE_SCRIPT = "agentmemory-bridge.mjs";
+// Each key installs with its own event argument: the bridge dispatches on
+// argv[2], so omitting it would make every capture a silent no-op.
 const HOOK_KEYS = ["session_start", "session_end", "post_tool", "turn_end"];
+
+// Bundled hooks the bridge spawns. Copied next to the bridge so the
+// install is self-contained (the npm package ships them under plugin/
+// scripts/).
+// _capture.mjs is a runtime dependency of every bundled hook — without it
+// the spawn hangs on module resolution.
+const BUNDLED_HOOKS = [
+  "session-start.mjs",
+  "session-end.mjs",
+  "post-tool-use.mjs",
+  "post-tool-failure.mjs",
+  "stop.mjs",
+  "_capture.mjs",
+];
+
+const DESIRED_MCP_ENTRY = { command: "agentmemory-mcp", timeout_secs: 60 };
 
 const BRIDGE_SOURCE = `#!/usr/bin/env node
 // agentmemory jcode bridge — translates jcode lifecycle-hook env vars into
@@ -43,12 +62,28 @@ const map = MAPPINGS[EVENT];
 if (!map) process.exit(0);
 
 const env = process.env;
-let stdin = "";
-if (EVENT === "post_tool") {
-  try { stdin = readFileSync(0, "utf8"); } catch {}
-}
+
+// jcode puts the tool-call input JSON in JCODE_HOOK_TOOL_INPUT (16KB cap);
+// stdin is only documented for other hook types, so read it as a fallback.
 let toolInput = {};
-try { toolInput = JSON.parse(stdin || "{}"); } catch {}
+// Prefer the env var; stdin is a fallback for other hook types. Never
+// block on a TTY stdin (manual runs) — a 100ms cap keeps this bounded.
+const rawInput = env.JCODE_HOOK_TOOL_INPUT ?? readStdinCapped();
+try { toolInput = JSON.parse(rawInput || "{}"); } catch {}
+
+function readStdinCapped() {
+  try {
+    if (process.stdin.isTTY) return "";
+    const timer = setTimeout(() => process.exit(0), 100);
+    const text = readFileSync(0, "utf8");
+    clearTimeout(timer);
+    return text;
+  } catch {
+    return "";
+  }
+}
+
+const isError = env.JCODE_HOOK_STATUS === "error";
 
 const payload = {
   session_id: env.JCODE_HOOK_SESSION_ID ?? "unknown",
@@ -56,17 +91,17 @@ const payload = {
   hook_event_name: map.event,
   tool_name: env.JCODE_HOOK_TOOL_NAME ?? "",
   tool_input: toolInput,
-  // jcode exposes output size only, never the raw output text.
-  tool_response: env.JCODE_HOOK_OUTPUT_BYTES
-    ? "[" + env.JCODE_HOOK_OUTPUT_BYTES + " bytes output]"
-    : "",
+  // jcode exposes the output size on success and the error text on failure.
+  tool_response: isError
+    ? (env.JCODE_HOOK_ERROR ?? "unknown error")
+    : env.JCODE_HOOK_OUTPUT_BYTES
+      ? "[" + env.JCODE_HOOK_OUTPUT_BYTES + " bytes output]"
+      : "",
   // The Stop hook reads the final assistant text through this field.
   prompt: env.JCODE_HOOK_LAST_ASSISTANT_TEXT ?? "",
 };
 
-const script = env.JCODE_HOOK_STATUS === "error" && map.error_script
-  ? map.error_script
-  : map.script;
+const script = isError && map.error_script ? map.error_script : map.script;
 const hookPath = join(dirname(fileURLToPath(import.meta.url)), script);
 
 try {
@@ -77,6 +112,24 @@ try {
 } catch {}
 process.exit(0);
 `;
+
+function bundledHookSource(hook: string): string {
+  // Locate the bundled script shipped under plugin/scripts in the npm
+  // package (dev: the repo checkout). Same walk as codex-hooks.ts.
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 12; i++) {
+    const candidate = join(dir, "plugin", "scripts", hook);
+    if (existsSync(candidate)) return readFileSync(candidate, "utf8");
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error(`agentmemory: bundled hook ${hook} not found`);
+}
+
+function fileURLToPath(url: string): string {
+  return url.startsWith("file://") ? url.slice("file://".length) : url;
+}
 
 export const adapter: ConnectAdapter = {
   name: "jcode",
@@ -90,49 +143,63 @@ export const adapter: ConnectAdapter = {
   },
   async install(opts: ConnectOptions): Promise<ConnectResult> {
     const configPath = jcodeConfigPath();
-    const bridgeCmd = join(PLUGIN_DIR, BRIDGE_SCRIPT);
+    const desiredServerJson = JSON.stringify(DESIRED_MCP_ENTRY);
 
-    // 1) Bridge script — installed before any config references it.
-    mkdirSync(dirname(bridgeCmd), { recursive: true });
-    if (!existsSync(bridgeCmd)) {
-      writeFileSync(bridgeCmd, BRIDGE_SOURCE);
-      chmodSync(bridgeCmd, 0o755);
-    }
-
-    // 2) MCP registration — merge, never clobber other servers.
-    const mcp = readJcodeMcpJson();
-    const servers = (mcp.mcpServers as Record<string, unknown>) ?? {};
-    const existing = servers.agentmemory;
-    if (
-      !existing ||
-      (typeof existing === "object" &&
-        JSON.stringify(existing) !==
-          JSON.stringify({ command: "agentmemory-mcp", timeout_secs: 60 }))
-    ) {
-      servers.agentmemory = servers.agentmemory ?? {
-        command: "agentmemory-mcp",
-        timeout_secs: 60,
-      };
-      mcp.mcpServers = servers;
-      writeJcodeMcpJson(mcp);
-    }
-
-    // 3) TOML hooks — append to arrays, preserve everything else.
-    let mutated = false;
-    for (const key of HOOK_KEYS) {
-      if (
-        upsertTomlArrayValue(configPath, "hooks", key, bridgeCmd) === "written"
-      ) {
-        mutated = true;
-      }
-    }
-
+    // Dry-run reports before any mutation.
     if (opts.dryRun) {
-      p.log.info(`[dry run] would wire ${HOOK_KEYS.join(", ")} in ${configPath}`);
+      console.log(
+        `[dry run] would install ${BUNDLED_HOOKS.length + 1} scripts in ${PLUGIN_DIR}, ` +
+          `register agentmemory in ${join(JCODE_DIR, "mcp.json")}, and wire ` +
+          `${HOOK_KEYS.join(", ")} in ${configPath}`,
+      );
       return { kind: "skipped", reason: "dry run" };
     }
 
-    if (!mutated && existsSync(bridgeCmd)) {
+    // 1) Bridge + bundled hook scripts, so the install is self-contained.
+    mkdirSync(PLUGIN_DIR, { recursive: true });
+    const bridgeCmd = join(PLUGIN_DIR, BRIDGE_SCRIPT);
+    writeFileSync(bridgeCmd, BRIDGE_SOURCE);
+    chmodSync(bridgeCmd, 0o755);
+    for (const hook of BUNDLED_HOOKS) {
+      const dest = join(PLUGIN_DIR, hook);
+      writeFileSync(dest, bundledHookSource(hook));
+      chmodSync(dest, 0o755);
+    }
+
+    // 2) MCP registration. A malformed existing mcp.json must abort the
+    // MCP step (the TOML hooks still install) rather than overwrite it.
+    let mcpMutated = false;
+    try {
+      const mcp = readJcodeMcpJson();
+      const servers = (mcp.mcpServers as Record<string, unknown>) ?? {};
+      const existingJson = servers.agentmemory
+        ? JSON.stringify(servers.agentmemory)
+        : null;
+      if (existingJson !== desiredServerJson) {
+        // Overwrite a stale/differing agentmemory entry; other servers in
+        // the file are untouched.
+        servers.agentmemory = { ...DESIRED_MCP_ENTRY };
+        mcp.mcpServers = servers;
+        writeJcodeMcpJson(mcp);
+        mcpMutated = true;
+      }
+    } catch (e) {
+      console.error(
+        `[agentmemory] ~/.jcode/mcp.json is unreadable, skipping the MCP entry: ` +
+          `${(e as Error).message}. TOML hooks are still installed.`,
+      );
+    }
+
+    // 3) TOML hooks — each key installs with its event argument.
+    let tomlMutated = false;
+    for (const key of HOOK_KEYS) {
+      const cmd = `${bridgeCmd} ${key}`;
+      if (upsertTomlArrayValue(configPath, "hooks", key, cmd) === "written") {
+        tomlMutated = true;
+      }
+    }
+
+    if (!mcpMutated && !tomlMutated) {
       return { kind: "already-wired", mutatedPath: configPath };
     }
     return { kind: "installed", mutatedPath: configPath };
@@ -143,9 +210,9 @@ export const adapter: ConnectAdapter = {
 // mcp.json/mcpServers.agentmemory removal — kept out of the adapter so
 // `connect` stays single-purpose (upstream convention: adapters install).
 export function uninstallJcode(): void {
-  const bridgeCmd = join(PLUGIN_DIR, BRIDGE_SCRIPT);
   for (const key of HOOK_KEYS) {
-    removeTomlArrayValue(jcodeConfigPath(), "hooks", key, bridgeCmd);
+    const cmd = `${join(PLUGIN_DIR, BRIDGE_SCRIPT)} ${key}`;
+    removeTomlArrayValue(jcodeConfigPath(), "hooks", key, cmd);
   }
   const mcp = readJcodeMcpJson();
   const servers = (mcp.mcpServers as Record<string, unknown>) ?? {};

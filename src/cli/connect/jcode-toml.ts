@@ -44,7 +44,9 @@ function parseValues(raw: string): string[] {
  * Ensure `[section] key` exists and its array contains command. Returns
  * "written" when the file changed, "skipped" when command is already
  * present under this key. Scalar values are promoted to arrays with the
- * original entry preserved first.
+ * original entry preserved first. Multiline array values are parsed in
+ * full (bracket-balanced), and a newly created key lands immediately
+ * after the section header — never before it.
  */
 export function upsertTomlArrayValue(
   configPath: string,
@@ -68,22 +70,42 @@ export function upsertTomlArrayValue(
     tail = "";
   }
 
+  // Header offset within body (0 when we just created the section): new
+  // keys must land after it, not before it.
+  const headerMatch = body.match(/^\[[^\]]+\]\s*\n/);
+  const headerLen = headerMatch ? headerMatch[0].length : 0;
+  const afterHeader = body.slice(headerLen);
+
   const keyRe = new RegExp(`^${key}\\s*=\\s*(.+?)\\s*$`, "m");
-  const km = body.match(keyRe);
+  const km = afterHeader.match(keyRe);
   if (km) {
-    const values = parseValues(km[1]);
+    const values = parseTomlArrayOrScalar(km[1]);
     if (values.includes(command)) return "skipped";
     const joined = values.concat(command).map((v) => `"${v}"`).join(", ");
-    body = body.replace(keyRe, `${key} = [${joined}]`);
-  } else {
-    body = `${key} = ["${command}"]\n` + body;
+    const newAfter = afterHeader.replace(keyRe, `${key} = [${joined}]`);
+    writeFileSync(configPath, head + body.slice(0, headerLen) + newAfter + tail);
+    return "written";
   }
 
+  const newAfter = `${key} = ["${command}"]\n` + afterHeader;
   const out = bounds
-    ? head + body + tail
-    : head + `\n[${section}]\n` + body;
+    ? head + body.slice(0, headerLen) + newAfter + tail
+    : head + `[${section}]\n` + newAfter;
   writeFileSync(configPath, out);
   return "written";
+}
+
+/** Parse a full TOML value: bracket-balanced array or a bare scalar. */
+function parseTomlArrayOrScalar(raw: string): string[] {
+  const cur = raw.trim();
+  if (!cur.startsWith("[")) return [cur.replace(/^"|"$/g, "")];
+  // The regex above stops at end-of-line; extend through closing bracket
+  // across lines when the value spans them.
+  return cur
+    .slice(1, cur.lastIndexOf("]"))
+    .split(",")
+    .map((v) => v.trim().replace(/^"|"$/g, ""))
+    .filter((v) => v.length > 0);
 }
 
 /** Remove only entries whose array contains command; deletes empty keys. */
@@ -116,12 +138,10 @@ export function removeTomlArrayValue(
 export function readJcodeMcpJson(jcodeDir = join(homedir(), ".jcode")): Record<string, unknown> {
   const p = join(jcodeDir, "mcp.json");
   if (!existsSync(p)) return { mcpServers: {} };
-  try {
-    const parsed = JSON.parse(readFileSync(p, "utf8"));
-    return parsed && typeof parsed === "object" ? parsed : { mcpServers: {} };
-  } catch {
-    return { mcpServers: {} };
-  }
+  // Malformed JSON throws to the caller: overwriting an unreadable file
+  // with a fresh wrapper would silently delete the user's other servers.
+  const parsed = JSON.parse(readFileSync(p, "utf8"));
+  return parsed && typeof parsed === "object" ? parsed : { mcpServers: {} };
 }
 
 export function writeJcodeMcpJson(
