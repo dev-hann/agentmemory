@@ -238,10 +238,19 @@ export function uninstallJcode(): void {
   for (const key of HOOK_KEYS) {
     removeTomlArrayValue(configPath, "hooks", key, hookCmd(key));
   }
-  const mcp = readJcodeMcpJson();
-  const servers = (mcp.mcpServers as Record<string, unknown>) ?? {};
-  if (servers.agentmemory !== undefined) {
-    delete servers.agentmemory;
-    writeJcodeMcpJson(mcp);
+  // Mirror install: an unreadable mcp.json must not fail the uninstall
+  // after the TOML hooks are already removed.
+  try {
+    const mcp = readJcodeMcpJson();
+    const servers = (mcp.mcpServers as Record<string, unknown>) ?? {};
+    if (servers.agentmemory !== undefined) {
+      delete servers.agentmemory;
+      writeJcodeMcpJson(mcp);
+    }
+  } catch (e) {
+    console.error(
+      `[agentmemory] ~/.jcode/mcp.json is unreadable, skipping MCP cleanup: ` +
+        `${(e as Error).message}. TOML hooks were still removed.`,
+    );
   }
 }

@@ -81,6 +81,16 @@ describe("jcode-toml upsertTomlArrayValue", () => {
     expect(keyIdx).toBeGreaterThan(hooksIdx);
   });
 
+  it("lands new keys after a section header at EOF without a trailing newline", () => {
+    const p = setup('[provider]\nmodel = "x"\n\n[hooks]');
+    const cmd = tomlHookCommand("/bridge.mjs", "post_tool");
+    upsertTomlArrayValue(p, "hooks", "post_tool", cmd);
+    const out = readFileSync(p, "utf8");
+    const hooksIdx = out.lastIndexOf("[hooks]");
+    expect(out.indexOf("post_tool =")).toBeGreaterThan(hooksIdx);
+    expect(tomlArrayContains(p, "hooks", "post_tool", cmd)).toBe(true);
+  });
+
   it("preserves a trailing comment after the value", () => {
     const p = setup("[hooks]\npost_tool = [\"a\"] # mine\n");
     upsertTomlArrayValue(p, "hooks", "post_tool", tomlHookCommand("/bridge.mjs", "post_tool"));

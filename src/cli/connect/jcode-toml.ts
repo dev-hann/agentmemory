@@ -309,6 +309,9 @@ export function upsertTomlArrayValue(
   if (bounds) {
     head = src.slice(0, bounds.start);
     body = src.slice(bounds.start, bounds.end);
+    // A [section] header at EOF with no trailing newline would otherwise
+    // fail the header match below and land new keys before the header.
+    if (body.length > 0 && !body.endsWith("\n")) body += "\n";
     tail = src.slice(bounds.end);
   } else {
     head = src.length > 0 && !src.endsWith("\n") ? src + "\n" : src;
