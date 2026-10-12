@@ -1,11 +1,13 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
 import {
   jcodeConfigPath,
   readJcodeMcpJson,
   removeTomlArrayValue,
+  tomlHookCommand,
   upsertTomlArrayValue,
   writeJcodeMcpJson,
 } from "./jcode-toml.js";
@@ -127,10 +129,6 @@ function bundledHookSource(hook: string): string {
   throw new Error(`agentmemory: bundled hook ${hook} not found`);
 }
 
-function fileURLToPath(url: string): string {
-  return url.startsWith("file://") ? url.slice("file://".length) : url;
-}
-
 export const adapter: ConnectAdapter = {
   name: "jcode",
   displayName: "jcode",
@@ -193,8 +191,7 @@ export const adapter: ConnectAdapter = {
     // 3) TOML hooks — each key installs with its event argument.
     let tomlMutated = false;
     for (const key of HOOK_KEYS) {
-      const cmd = `${bridgeCmd} ${key}`;
-      if (upsertTomlArrayValue(configPath, "hooks", key, cmd) === "written") {
+      if (upsertTomlArrayValue(configPath, "hooks", key, tomlHookCommand(bridgeCmd, key)) === "written") {
         tomlMutated = true;
       }
     }
@@ -211,8 +208,7 @@ export const adapter: ConnectAdapter = {
 // `connect` stays single-purpose (upstream convention: adapters install).
 export function uninstallJcode(): void {
   for (const key of HOOK_KEYS) {
-    const cmd = `${join(PLUGIN_DIR, BRIDGE_SCRIPT)} ${key}`;
-    removeTomlArrayValue(jcodeConfigPath(), "hooks", key, cmd);
+    removeTomlArrayValue(jcodeConfigPath(), "hooks", key, tomlHookCommand(join(PLUGIN_DIR, BRIDGE_SCRIPT), key));
   }
   const mcp = readJcodeMcpJson();
   const servers = (mcp.mcpServers as Record<string, unknown>) ?? {};

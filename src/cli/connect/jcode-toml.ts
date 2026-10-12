@@ -27,17 +27,162 @@ function sectionBounds(src: string, section: string): { start: number; end: numb
   return { start, end };
 }
 
-function parseValues(raw: string): string[] {
-  const cur = raw.trim();
-  if (cur.startsWith("[")) {
-    // Split on commas outside quotes.
-    const inner = cur.slice(1, cur.lastIndexOf("]"));
-    return inner
-      .match(/(?:[^,"]|"[^"]*")+/g)
-      ?.map((v) => v.trim().replace(/^"|"$/g, ""))
-      .filter((v) => v.length > 0) ?? [];
+export function escapeTomlString(v: string): string {
+  return `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function unescapeTomlString(v: string): string {
+  return v.replace(/\\(["\\])/g, "$1");
+}
+
+/** The exact command string installed for a hook key; uninstall matches it. */
+export function tomlHookCommand(bridgePath: string, key: string): string {
+  return `node "${bridgePath}" ${key}`;
+}
+
+/**
+ * Index just past the TOML value that starts at or after pos. Values may
+ * span lines (arrays), contain quoted "]" and "," characters, and carry
+ * comments; a value that cannot be scanned to its end throws so callers
+ * never write a half-parsed file.
+ */
+function scanValueEnd(src: string, pos: number): number {
+  let i = pos;
+  while (i < src.length && /\s/.test(src[i])) i++;
+  if (src.startsWith('"""', i) || src.startsWith("'''", i)) {
+    throw new Error("agentmemory: multiline TOML strings are not supported in [hooks]");
   }
-  return [cur.replace(/^"|"$/g, "")];
+  if (src[i] === '"') return scanBasicString(src, i);
+  if (src[i] === "[") return scanArray(src, i);
+  const nl = src.indexOf("\n", i);
+  const lineEnd = nl === -1 ? src.length : nl;
+  const hash = src.indexOf("#", i);
+  return hash !== -1 && hash < lineEnd ? src.slice(0, hash).replace(/\s+$/, "").length : lineEnd;
+}
+
+function scanBasicString(src: string, start: number): number {
+  let i = start + 1;
+  while (i < src.length) {
+    if (src[i] === "\\") {
+      i += 2;
+      continue;
+    }
+    if (src[i] === '"') return i + 1;
+    if (src[i] === "\n") break;
+    i++;
+  }
+  throw new Error("agentmemory: unterminated TOML string in [hooks]");
+}
+
+function scanArray(src: string, start: number): number {
+  let depth = 0;
+  let i = start;
+  let inString = false;
+  while (i < src.length) {
+    const c = src[i];
+    if (inString) {
+      if (c === "\\") {
+        i += 2;
+        continue;
+      }
+      if (c === '"') inString = false;
+      i++;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      i++;
+      continue;
+    }
+    if (c === "#") {
+      const nl = src.indexOf("\n", i);
+      if (nl === -1) throw new Error("agentmemory: unterminated comment in TOML array");
+      i = nl + 1;
+      continue;
+    }
+    if (c === "[") {
+      depth++;
+      i++;
+      continue;
+    }
+    if (c === "]") {
+      depth--;
+      i++;
+      if (depth === 0) return i;
+      continue;
+    }
+    i++;
+  }
+  throw new Error("agentmemory: unterminated TOML array in [hooks]");
+}
+
+/** Full value span for `key =` anywhere in text; null when the key is absent. */
+function findKeySpan(text: string, key: string): { start: number; end: number; raw: string } | null {
+  const re = new RegExp(`^[ \\t]*${key}[ \\t]*=`, "m");
+  const m = re.exec(text);
+  if (!m) return null;
+  const valueEnd = scanValueEnd(text, m.index + m[0].length);
+  return { start: m.index, end: valueEnd, raw: text.slice(m.index + m[0].length, valueEnd) };
+}
+
+/** Split an array literal's inner text on commas outside quotes, dropping comments. */
+function splitTomlArray(raw: string): string[] {
+  const inner = raw.slice(1, -1);
+  const parts: string[] = [];
+  let cur = "";
+  let inString = false;
+  let i = 0;
+  while (i < inner.length) {
+    const c = inner[i];
+    if (inString) {
+      cur += c;
+      if (c === "\\" && i + 1 < inner.length) {
+        cur += inner[i + 1];
+        i += 2;
+        continue;
+      }
+      if (c === '"') inString = false;
+      i++;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      cur += c;
+      i++;
+      continue;
+    }
+    if (c === "#") {
+      const nl = inner.indexOf("\n", i);
+      if (nl === -1) break;
+      i = nl + 1;
+      continue;
+    }
+    if (c === ",") {
+      parts.push(cur);
+      cur = "";
+      i++;
+      continue;
+    }
+    cur += c;
+    i++;
+  }
+  parts.push(cur);
+  return parts
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
+    .map((p) =>
+      p.startsWith('"') && p.endsWith('"') && p.length >= 2 ? unescapeTomlString(p.slice(1, -1)) : p,
+    );
+}
+
+/** Parse a complete TOML value: array (any layout) or scalar. */
+function parseTomlValue(raw: string): string[] {
+  const cur = raw.trim();
+  if (cur.startsWith("[")) return splitTomlArray(cur);
+  if (cur.startsWith('"') && cur.endsWith('"') && cur.length >= 2) {
+    return [unescapeTomlString(cur.slice(1, -1))];
+  }
+  return [cur];
 }
 
 /**
@@ -76,36 +221,23 @@ export function upsertTomlArrayValue(
   const headerLen = headerMatch ? headerMatch[0].length : 0;
   const afterHeader = body.slice(headerLen);
 
-  const keyRe = new RegExp(`^${key}\\s*=\\s*(.+?)\\s*$`, "m");
-  const km = afterHeader.match(keyRe);
-  if (km) {
-    const values = parseTomlArrayOrScalar(km[1]);
+  const span = findKeySpan(afterHeader, key);
+  if (span) {
+    const values = parseTomlValue(span.raw);
     if (values.includes(command)) return "skipped";
-    const joined = values.concat(command).map((v) => `"${v}"`).join(", ");
-    const newAfter = afterHeader.replace(keyRe, `${key} = [${joined}]`);
+    const joined = values.concat(command).map((v) => escapeTomlString(v)).join(", ");
+    const newAfter =
+      afterHeader.slice(0, span.start) + `${key} = [${joined}]` + afterHeader.slice(span.end);
     writeFileSync(configPath, head + body.slice(0, headerLen) + newAfter + tail);
     return "written";
   }
 
-  const newAfter = `${key} = ["${command}"]\n` + afterHeader;
+  const newAfter = `${key} = [${escapeTomlString(command)}]\n` + afterHeader;
   const out = bounds
     ? head + body.slice(0, headerLen) + newAfter + tail
     : head + `[${section}]\n` + newAfter;
   writeFileSync(configPath, out);
   return "written";
-}
-
-/** Parse a full TOML value: bracket-balanced array or a bare scalar. */
-function parseTomlArrayOrScalar(raw: string): string[] {
-  const cur = raw.trim();
-  if (!cur.startsWith("[")) return [cur.replace(/^"|"$/g, "")];
-  // The regex above stops at end-of-line; extend through closing bracket
-  // across lines when the value spans them.
-  return cur
-    .slice(1, cur.lastIndexOf("]"))
-    .split(",")
-    .map((v) => v.trim().replace(/^"|"$/g, ""))
-    .filter((v) => v.length > 0);
 }
 
 /** Remove only entries whose array contains command; deletes empty keys. */
@@ -120,17 +252,21 @@ export function removeTomlArrayValue(
   const bounds = sectionBounds(src, section);
   if (!bounds) return;
   const body = src.slice(bounds.start, bounds.end);
-  const keyRe = new RegExp(`^${key}\\s*=\\s*(.+?)\\s*$`, "m");
-  const km = body.match(keyRe);
-  if (!km) return;
-  const values = parseValues(km[1]).filter((v) => v !== command);
-  let newBody: string;
-  if (values.length === 0) {
-    newBody = body.replace(keyRe, "").replace(/\n{3,}/g, "\n\n");
-  } else {
-    const joined = values.map((v) => `"${v}"`).join(", ");
-    newBody = body.replace(keyRe, `${key} = [${joined}]`);
+  const span = findKeySpan(body, key);
+  if (!span) return;
+  const parsed = parseTomlValue(span.raw);
+  if (!parsed.includes(command)) return;
+  const values = parsed.filter((v) => v !== command);
+
+  let replacement = "";
+  if (values.length > 0) {
+    replacement = `${key} = [${values.map((v) => escapeTomlString(v)).join(", ")}]`;
   }
+  const rest = body.slice(span.end);
+  const lineRemainder = rest.match(/^[ \t]*(#[^\n]*)?(?:\n|$)/);
+  const skipLen = replacement === "" && lineRemainder ? lineRemainder[0].length : 0;
+  let newBody = body.slice(0, span.start) + replacement + rest.slice(skipLen);
+  newBody = newBody.replace(/\n{3,}/g, "\n\n");
   writeFileSync(configPath, src.slice(0, bounds.start) + newBody + src.slice(bounds.end));
 }
 
