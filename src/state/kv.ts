@@ -1,5 +1,6 @@
 import type { IIIClient } from 'iii-sdk'
 import { withKeyedLock } from './keyed-mutex.js'
+import { resolveGraphScope, notifyGraphGenerationChange } from './graph-generation.js'
 
 export type StateBackend = 'file' | 'redis'
 
@@ -112,6 +113,7 @@ export class StateKV {
   }
 
   async get<T = unknown>(scope: string, key: string): Promise<T | null> {
+    scope = await resolveGraphScope(this, scope)
     return this.sdk.trigger<{ scope: string; key: string }, T | null>({
       function_id: 'state::get',
       payload: { scope, key },
@@ -119,36 +121,49 @@ export class StateKV {
   }
 
   async set<T = unknown>(scope: string, key: string, value: T): Promise<T> {
-    return this.sdk.trigger<{ scope: string; key: string; value: T }, T>({
+    scope = await resolveGraphScope(this, scope)
+    const result = await this.sdk.trigger<{ scope: string; key: string; value: T }, T>({
       function_id: 'state::set',
       payload: { scope, key, value },
     })
+    await notifyGraphGenerationChange(this, scope, key)
+    return result
   }
 
   async update<T = unknown>(scope: string, key: string, ops: UpdateOp[]): Promise<T> {
+    scope = await resolveGraphScope(this, scope)
     if (this.backend === 'redis' && canApplyLocally(ops)) {
       return withKeyedLock(`state-update:${scope}\u0000${key}`, async () => {
-        const oldValue = await this.get<unknown>(scope, key)
+        // Keep both halves on the scope resolved before acquiring the lock.
+        const oldValue = await this.sdk.trigger<{ scope: string; key: string }, unknown>({
+          function_id: 'state::get', payload: { scope, key },
+        })
         const newValue = applyUpdateOps(oldValue, ops)
-        await this.set(scope, key, newValue)
+        await this.sdk.trigger({ function_id: 'state::set', payload: { scope, key, value: newValue } })
+        await notifyGraphGenerationChange(this, scope, key)
         const result: UpdateResult = { old_value: oldValue, new_value: newValue, errors: [] }
         return result as T
       })
     }
-    return this.sdk.trigger<{ scope: string; key: string; ops: UpdateOp[] }, T>({
+    const result = await this.sdk.trigger<{ scope: string; key: string; ops: UpdateOp[] }, T>({
       function_id: 'state::update',
       payload: { scope, key, ops },
     })
+    await notifyGraphGenerationChange(this, scope, key)
+    return result
   }
 
   async delete(scope: string, key: string): Promise<void> {
-    return this.sdk.trigger<{ scope: string; key: string }, void>({
+    scope = await resolveGraphScope(this, scope)
+    await this.sdk.trigger<{ scope: string; key: string }, void>({
       function_id: 'state::delete',
       payload: { scope, key },
     })
+    await notifyGraphGenerationChange(this, scope, key)
   }
 
   async list<T = unknown>(scope: string): Promise<T[]> {
+    scope = await resolveGraphScope(this, scope)
     const values = await this.sdk.trigger<{ scope: string }, T[]>({
       function_id: 'state::list',
       payload: { scope },

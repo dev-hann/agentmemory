@@ -71,7 +71,7 @@
   <picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/stat-tools.svg"><img src="assets/tags/stat-tools.svg" alt="54 MCP tools" height="38" /></picture>
   <picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/stat-hooks.svg"><img src="assets/tags/stat-hooks.svg" alt="12 auto hooks" height="38" /></picture>
   <picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/stat-deps.svg"><img src="assets/tags/stat-deps.svg" alt="0 external DBs" height="38" /></picture>
-  <picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/stat-tests.svg"><img src="assets/tags/stat-tests.svg" alt="2,700+ tests passing" height="38" /></picture>
+  <picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/stat-tests.svg"><img src="assets/tags/stat-tests.svg" alt="2,800+ tests passing" height="38" /></picture>
 </p>
 
 <p align="center">
@@ -1061,11 +1061,15 @@ Memories decay over time (Ebbinghaus curve). Frequently accessed memories streng
 | **Auto-forgetting** | TTL expiry, contradiction detection, importance eviction |
 | **Privacy first** | API keys, secrets, `<private>` tags stripped before storage |
 | **Self-healing** | Circuit breaker, provider fallback chain, health monitoring |
-| **Claude bridge** | Bi-directional sync with MEMORY.md |
+| **Claude bridge** | Read MEMORY.md and export project memories without replacing existing files |
 | **Knowledge graph** | Entity extraction + BFS traversal |
 | **Team memory** | Namespaced shared + private across team members |
 | **Citation provenance** | Trace any memory back to source observations |
 | **Git snapshots** | Version, rollback, and diff memory state |
+
+The Claude bridge is opt-in: set `CLAUDE_MEMORY_BRIDGE=true` and `CLAUDE_PROJECT_PATH` to your project directory, then restart agentmemory. `memory_claude_bridge_sync` exports only the latest memories scoped to that project, excluding unscoped memories. The read direction continues to read existing `MEMORY.md` content.
+
+Export creates `MEMORY.md` only when it is absent. Existing files are preserved, including previous generated exports and edits made by you or Claude Code. Identical content returns `changed: false`; different content returns an error. To regenerate deliberately, move the existing file to a backup location (or remove it if no longer needed), then run the tool again. See the bridge settings in [`.env.example`](.env.example).
 
 ---
 
@@ -1150,7 +1154,7 @@ Three tool surfaces, smallest to largest: `AGENTMEMORY_TOOLS=core` trims visibil
 | `memory_relations` | Query relationship graph |
 | `memory_graph_query` | Knowledge graph traversal |
 | `memory_consolidate` | Run 4-tier consolidation |
-| `memory_claude_bridge_sync` | Sync with MEMORY.md |
+| `memory_claude_bridge_sync` | Read MEMORY.md or create a project export, preserving existing files |
 | `memory_team_share` | Share with team members |
 | `memory_team_feed` | Recent shared items |
 | `memory_audit` | Audit trail of operations |
@@ -1446,7 +1450,7 @@ fi
 | Prometheus / Grafana | iii OTEL + health monitor |
 | Custom plugin systems | `iii worker add <name>` |
 
-**223 source files · ~53,000 LOC · 2,700+ tests · 312 functions · 60 KV scopes**, all on three primitives. No `agentmemory plugin install`. The plugin system is iii itself.
+**225 source files · ~53,000 LOC · 2,800+ tests · 312 functions · 61 KV scopes**, all on three primitives. No `agentmemory plugin install`. The plugin system is iii itself.
 
 ---
 
@@ -1829,6 +1833,7 @@ curl -H "Authorization: Bearer $(cat ~/.agentmemory/secret)" http://localhost:31
 | `GET` | `/agentmemory/export` | Export all data |
 | `POST` | `/agentmemory/import` | Import from JSON |
 | `POST` | `/agentmemory/graph/query` | Knowledge graph query |
+| `POST` | `/agentmemory/graph/reset` | Start an empty graph generation; retain observations and memories |
 | `POST` | `/agentmemory/graph/compact` | Trim oversized graph provenance |
 | `POST` | `/agentmemory/team/share` | Share with team |
 | `GET` | `/agentmemory/audit` | Audit trail |
@@ -1850,6 +1855,10 @@ Full endpoint list: [`src/triggers/api.ts`](src/triggers/api.ts)
 Failed events are retried every `AGENTMEMORY_CAPTURE_RETRY_INTERVAL_MS` (10 s) with doubling backoff, up to `AGENTMEMORY_CAPTURE_MAX_ATTEMPTS` (5). Events that still fail stay in the inbox as dead letters, are listed on `/agentmemory/status` and the viewer Health page, and can be retried with `POST /agentmemory/capture/retry` (`{"eventId": "..."}` or `{"all": true}`). Accepted event ids are remembered for `AGENTMEMORY_CAPTURE_DEDUP_HOURS` (168 hours, at most `AGENTMEMORY_CAPTURE_EVENTS_MAX` ids), so a hook replayed after a timeout or a restart is stored once, while two separate tool calls with their own host ids are stored twice even when their content is identical. When an observation is deleted (forget, session delete, eviction, auto-forget or an import that replaces the store), its event is marked as deleted before the observation is removed, so a replay of that event inside the same window is answered as a duplicate and stores nothing. The state store writes to disk every 2 seconds, so an answered event can still be only in memory for a moment. To cover that, every `2xx` answer also carries the server's `bootId` (new at every start), `acceptedAt` and `durableAfterMs` (the save interval plus 1.5 s on the file store, 1.5 s on redis, where persistence is the operator's setting). Hooks keep the event in the local spool until that window has passed and delete it on a later call without another request. If the `bootId` has changed by then, the server restarted, so the hook sends the event again with the same `eventId`; an event that did reach the disk is not stored twice. The server also sends such events itself at start and every retry interval, so a restart loses nothing even when no hook runs afterwards. Older hooks ignore the extra fields, and new hooks against an older server discard the event on `2xx` as before.
 
 When the server is down, does not answer in time or returns a 5xx, the hook appends the observation to a local spool file, `<data dir>/capture-spool/<host>-<port>.jsonl` (override the folder with `AGENTMEMORY_CAPTURE_SPOOL_DIR`). The file is private to your user (mode 600), secrets are redacted the same way the server redacts them, it holds at most `AGENTMEMORY_CAPTURE_SPOOL_MAX_BYTES` (5 MiB) and drops entries older than `AGENTMEMORY_CAPTURE_SPOOL_MAX_AGE_HOURS` (168). When it is full, new entries are dropped and counted, and `/agentmemory/status` reports it. The hook still exits 0 within its time limit and adds no request when the server is healthy. The spool is sent at the next start and by the first hook that reaches the server again, in a background process so the agent does not wait. Event ids make this safe: an observation that did arrive before a timeout is not stored twice. `npx @agentmemory/agentmemory capture` shows the spool and the server inbox, `--drain` sends the spool now, and `GET /agentmemory/capture` returns the same as JSON. Set `AGENTMEMORY_CAPTURE_SPOOL=false` to turn the spool off.
+
+**Resetting the graph.** Call `POST /agentmemory/graph/reset` to start a new graph generation. The previous graph becomes inaccessible to graph queries, node lookups, statistics, and MCP reads; new imports and extraction populate the new generation. Existing observations and memories remain available. Old graph storage is retained.
+
+**Upgrading from v0.9.30:** if you already reset the graph before upgrading, run `POST /agentmemory/graph/reset` again after the upgrade. Earlier reset timestamps are not used to infer a completed generation reset.
 
 **Compacting graph provenance.** Each knowledge graph node and edge keeps the ids of the newest 32 observations it came from. Stores written before that cap can hold thousands of ids per hot node, which makes graph search and the viewer slow or drops the worker. agentmemory fixes this by itself: on the first start after upgrading it trims every node, edge, superseded edge (the temporal graph history) and the cached snapshot to the cap in the background, in small slices with a pause between them, so search, capture and the viewer keep working. It saves its progress, resumes after a restart and never runs again once it has finished. `/agentmemory/status` and the viewer Health page show it as pending, running (with the current scope and position), done or failed. Set `AGENTMEMORY_GRAPH_COMPACT_ON_BOOT=false` to turn it off.
 
@@ -1873,7 +1882,7 @@ curl -X POST http://localhost:3111/agentmemory/graph/compact -H "Content-Type: a
 ```bash
 npm run dev               # Hot reload
 npm run build             # Production build
-npm test                  # 2,700+ tests
+npm test                  # 2,800+ tests
 npm run test:integration  # API tests (requires running services)
 ```
 

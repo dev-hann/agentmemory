@@ -1,3 +1,4 @@
+import { pinGraphState } from "../state/graph-generation.js";
 import type { IIIClient } from "iii-sdk";
 import { markCaptureEventDeleted } from "../capture/event-record.js";
 import type {
@@ -103,9 +104,10 @@ export class ExportBudget {
   }
 }
 
-export function registerExportImportFunction(sdk: IIIClient, kv: StateKV): void {
+export function registerExportImportFunction(sdk: IIIClient, state: StateKV): void {
   sdk.registerFunction("mem::export",
     async (data?: { maxSessions?: number; offset?: number }) => {
+      const kv = await pinGraphState(state);
       const rawMax = Number(data?.maxSessions);
       const maxSessions = Number.isFinite(rawMax) && rawMax > 0 ? Math.min(Math.floor(rawMax), 1000) : undefined;
       const rawOffset = Number(data?.offset);
@@ -216,6 +218,7 @@ export function registerExportImportFunction(sdk: IIIClient, kv: StateKV): void 
       exportData: ExportData;
       strategy?: "merge" | "replace" | "skip";
     }) => {
+      const kv = await pinGraphState(state);
       if (
         !data?.exportData ||
         typeof data.exportData !== "object" ||

@@ -9,6 +9,7 @@ import { KV } from "../state/schema.js";
 import { isSearchLayer, type SearchLayer } from "../state/search-layer.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { StateKV } from "../state/kv.js";
+import { pinGraphState } from "../state/graph-generation.js";
 import { addSessionToProjectIndex } from "../state/session-index.js";
 import { getLatestHealth } from "../health/monitor.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
@@ -3574,11 +3575,12 @@ export function registerApiTriggers(
         actions: df(actions, "updatedAt"),
       };
       if (!project) {
+        const graphState = await pinGraphState(kv);
         const semantic = await kv.list<import("../types.js").SemanticMemory>(KV.semantic);
         const procedural = await kv.list<import("../types.js").ProceduralMemory>(KV.procedural);
         const relations = await kv.list<import("../types.js").MemoryRelation>(KV.relations);
-        const graphNodes = await kv.list<import("../types.js").GraphNode>(KV.graphNodes);
-        const graphEdges = await kv.list<import("../types.js").GraphEdge>(KV.graphEdges);
+        const graphNodes = await graphState.list<import("../types.js").GraphNode>(KV.graphNodes);
+        const graphEdges = await graphState.list<import("../types.js").GraphEdge>(KV.graphEdges);
         body.semantic = df(semantic, "updatedAt");
         body.procedural = df(procedural, "updatedAt");
         body.relations = df(relations, "createdAt");

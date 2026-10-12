@@ -16,6 +16,7 @@ export const KV = {
   profiles: "mem:profiles",
   claudeBridge: "mem:claude-bridge",
   graphNodes: "mem:graph:nodes",
+  graphControl: "mem:graph:control",
   graphEdges: "mem:graph:edges",
   graphSnapshot: "mem:graph:snapshot",
   graphNameIndex: "mem:graph:name-index",

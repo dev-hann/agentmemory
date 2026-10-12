@@ -1,3 +1,4 @@
+import { pinGraphState } from "../state/graph-generation.js";
 import type {
   GraphNode,
   GraphEdge,
@@ -48,8 +49,9 @@ export class GraphRetrieval {
     maxResults = 20,
     targetLayer: SearchLayer = "all",
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const kv = await pinGraphState(this.kv);
+    const allNodes = (await kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
+    const allEdges = (await kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
 
     const matchingNodes = allNodes.filter((n) => {
       const nameLower = n.name.toLowerCase();
@@ -122,8 +124,9 @@ export class GraphRetrieval {
     maxResults = 10,
     targetLayer: SearchLayer = "all",
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const kv = await pinGraphState(this.kv);
+    const allNodes = (await kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
+    const allEdges = (await kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
 
     const linkedNodes = allNodes.filter((n) =>
       n.sourceObservationIds.some((id) => obsIds.includes(id)),
@@ -166,8 +169,9 @@ export class GraphRetrieval {
     currentState: GraphEdge[];
     history: GraphEdge[];
   }> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const kv = await pinGraphState(this.kv);
+    const allNodes = (await kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
+    const allEdges = (await kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
 
     const entity = allNodes.find(
       (n) => n.name.toLowerCase() === entityName.toLowerCase(),

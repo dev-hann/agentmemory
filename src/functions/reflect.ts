@@ -1,3 +1,4 @@
+import { pinGraphState } from "../state/graph-generation.js";
 import type { IIIClient } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
@@ -162,11 +163,13 @@ function buildJaccardClusters(
 
 export function registerReflectFunctions(
   sdk: IIIClient,
-  kv: StateKV,
+  state: StateKV,
   provider: MemoryProvider,
 ): void {
+  const kv = state;
   sdk.registerFunction("mem::reflect", 
     async (data: { maxClusters?: number; project?: string }) => {
+      const kv = await pinGraphState(state);
       const maxClusters = Math.min(data?.maxClusters ?? 10, 20);
       const maxInsightsPerCluster = 5;
       const maxTotal = 50;

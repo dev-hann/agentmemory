@@ -1,3 +1,4 @@
+import { pinGraphState } from "../state/graph-generation.js";
 import type { IIIClient } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
@@ -166,9 +167,10 @@ async function lwwMergeGraphEdges(
 
 export function registerMeshFunction(
   sdk: IIIClient,
-  kv: StateKV,
+  state: StateKV,
   meshAuthToken?: string,
 ): void {
+  const kv = state;
   sdk.registerFunction("mem::mesh-register",
     async (data: {
       url: string;
@@ -223,6 +225,7 @@ export function registerMeshFunction(
 
   sdk.registerFunction("mem::mesh-sync",
     async (data: { peerId?: string; scopes?: string[]; direction?: "push" | "pull" | "both" }) => {
+      const kv = await pinGraphState(state);
       if (!meshAuthToken) {
         return {
           success: false,
@@ -362,6 +365,7 @@ export function registerMeshFunction(
 
   sdk.registerFunction("mem::mesh-receive",
     async (data: MeshSyncPayload) => {
+      const kv = await pinGraphState(state);
       if (!data || typeof data !== "object") {
         return { success: false, error: "payload required" };
       }

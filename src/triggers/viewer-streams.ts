@@ -1,6 +1,8 @@
 import type { IIIClient } from "iii-sdk";
 import type { HttpRequest } from "@iii-dev/helpers/http";
 import type { StateKV } from "../state/kv.js";
+import { isLegacyGraphState, setGraphGenerationListener } from "../state/graph-generation.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
 import type {
   Action,
@@ -197,8 +199,9 @@ export function registerViewerStreamTriggers(
   let lastGraphSnapshotEventAt = 0;
   sdk.registerFunction(
     "event::viewer::graph-snapshot-changed",
-    async (payload: StatePayload<GraphSnapshot>) => {
+    async (payload: StatePayload<GraphSnapshot>) => withKeyedLock("graph:viewer-events", async () => {
       if (payload.key !== GRAPH_SNAPSHOT_KEY) return { emitted: false };
+      if (!await isLegacyGraphState(kv)) return { emitted: false };
       const snapshot = isStateDelete(payload) ? null : payload.new_value ?? null;
       noteGraphStats(snapshot?.stats ?? { totalNodes: 0, totalEdges: 0, nodesByType: {}, edgesByType: {} });
       lastGraphSnapshotEventAt = Date.now();
@@ -210,7 +213,7 @@ export function registerViewerStreamTriggers(
         delta: graphSnapshotDelta(payload.old_value ?? null, snapshot),
       });
       return { emitted: true };
-    },
+    }),
   );
   sdk.registerTrigger({
     type: "state",
@@ -245,12 +248,36 @@ export function registerViewerStreamTriggers(
   }
   for (const [kind, scope] of [["nodes", KV.graphNodes], ["edges", KV.graphEdges]] as const) {
     const functionId = `event::viewer::graph-${kind}-changed`;
-    sdk.registerFunction(functionId, async () => {
+    sdk.registerFunction(functionId, async () => withKeyedLock("graph:viewer-events", async () => {
+      if (!await isLegacyGraphState(kv)) return { emitted: false };
       noteGraphItem(kind);
       return { emitted: true };
-    });
+    }));
     sdk.registerTrigger({ type: "state", function_id: functionId, config: { scope } });
   }
+
+  setGraphGenerationListener(async (kind) => withKeyedLock("graph:viewer-events", async () => {
+    if (kind === "nodes" || kind === "edges") {
+      noteGraphItem(kind);
+      return;
+    }
+    if (kind === "reset") {
+      if (graphItemsTimer) clearTimeout(graphItemsTimer);
+      graphItemsTimer = null;
+      pendingGraphItems.nodes = 0;
+      pendingGraphItems.edges = 0;
+    }
+    const snapshot = await kv.get<GraphSnapshot>(KV.graphSnapshot, GRAPH_SNAPSHOT_KEY);
+    noteGraphStats(snapshot?.stats ?? { totalNodes: 0, totalEdges: 0, nodesByType: {}, edgesByType: {} });
+    lastGraphSnapshotEventAt = Date.now();
+    await sendViewerEvent(sdk, eventId("graph", "snapshot"), "graph.changed", {
+      source: "snapshot",
+      stats: snapshot?.stats ?? null,
+      updatedAt: snapshot?.updatedAt ?? new Date().toISOString(),
+      resetAt: snapshot?.resetAt ?? null,
+      delta: graphSnapshotDelta(null, snapshot),
+    });
+  }));
 
   sdk.registerFunction(
     "event::viewer::consolidation-changed",

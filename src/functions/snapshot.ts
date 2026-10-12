@@ -1,3 +1,4 @@
+import { pinGraphState } from "../state/graph-generation.js";
 import type { IIIClient } from "iii-sdk";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -41,7 +42,7 @@ async function ensureGitRepo(dir: string): Promise<void> {
 
 export function registerSnapshotFunction(
   sdk: IIIClient,
-  kv: StateKV,
+  state: StateKV,
   snapshotDir: string,
 ): void {
   // Serialize snapshots: the periodic timer, REST (api::snapshot-create), and
@@ -52,6 +53,7 @@ export function registerSnapshotFunction(
 
   sdk.registerFunction("mem::snapshot-create",
     async (data?: { message?: string }) => {
+      const kv = await pinGraphState(state);
       if (snapshotInFlight) {
         return { success: true, message: "Snapshot already in progress" };
       }
@@ -170,6 +172,7 @@ export function registerSnapshotFunction(
 
   sdk.registerFunction("mem::snapshot-restore", 
     async (data: { commitHash: string } | undefined) => {
+      const kv = await pinGraphState(state);
       if (!data || typeof data.commitHash !== "string" || !data.commitHash.trim()) {
         return { success: false, error: "commitHash is required" };
       }
