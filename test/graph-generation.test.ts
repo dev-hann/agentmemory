@@ -91,7 +91,12 @@ describe("graph generation reset", () => {
     await kv.set(KV.graphNodes, "undated", { ...node("undated"), createdAt: undefined });
     const retrieval = new GraphRetrieval(kv);
     expect(await retrieval.searchByEntities(["alpha"])).not.toEqual([]);
-    expect((await call("mem::graph-reset")).success).toBe(true);
+    expect(await call("mem::graph-reset")).toMatchObject({
+      success: true,
+      resetMode: "generation",
+      physicalStorageRetained: true,
+      message: expect.stringContaining("does not reclaim disk space"),
+    });
     // Physical legacy rows remain, but no logical read can fall back to them.
     expect(store.get(KV.graphNodes)?.size).toBe(3);
     for (const scope of [KV.graphNodes, KV.graphEdges, KV.graphEdgeHistory, KV.graphNameIndex, KV.graphEdgeKey, KV.graphNodeDegree]) {

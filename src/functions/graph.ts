@@ -1242,6 +1242,13 @@ export function registerGraphFunction(
     };
     const tookMs = Date.now() - started;
     logger.info("Graph state reset", { counts, tookMs });
-    return { success: true, cleared: counts, tookMs };
+    return {
+      success: true,
+      cleared: counts,
+      resetMode: "generation",
+      physicalStorageRetained: true,
+      message: "The active graph is empty. Previous graph storage is retained; this operation does not reclaim disk space.",
+      tookMs,
+    };
   });
 }

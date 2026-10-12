@@ -28,6 +28,7 @@ import {
 } from "../functions/search.js";
 import {
   getViewerCounts,
+  invalidateViewerCounts,
   noteGraphStats,
   noteRowChange,
   setViewerCountsEmitter,
@@ -196,7 +197,19 @@ export function registerViewerStreamTriggers(
     void sendViewerEvent(sdk, eventId("audit", entry.id), "audit.created", { id: entry.id, audit: entry }).catch(() => {});
   });
 
-  let lastGraphSnapshotEventAt = 0;
+  let lastGraphSnapshotEventAt = Number.NEGATIVE_INFINITY;
+  let lastGenerationSnapshot: { generation: string | null; snapshot: GraphSnapshot | null } | null = null;
+
+  async function readGenerationSnapshot() {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const generation = await kv.get<string>(KV.graphControl, "generation");
+      const snapshot = await kv.get<GraphSnapshot>(KV.graphSnapshot, GRAPH_SNAPSHOT_KEY);
+      if (generation === await kv.get<string>(KV.graphControl, "generation")) {
+        return { generation, snapshot };
+      }
+    }
+    throw new Error("Graph generation changed while reading snapshot");
+  }
   sdk.registerFunction(
     "event::viewer::graph-snapshot-changed",
     async (payload: StatePayload<GraphSnapshot>) => withKeyedLock("graph:viewer-events", async () => {
@@ -204,14 +217,20 @@ export function registerViewerStreamTriggers(
       if (!await isLegacyGraphState(kv)) return { emitted: false };
       const snapshot = isStateDelete(payload) ? null : payload.new_value ?? null;
       noteGraphStats(snapshot?.stats ?? { totalNodes: 0, totalEdges: 0, nodesByType: {}, edgesByType: {} });
-      lastGraphSnapshotEventAt = Date.now();
-      await sendViewerEvent(sdk, eventId("graph", "snapshot"), "graph.changed", {
-        source: "snapshot",
-        stats: snapshot?.stats ?? null,
-        updatedAt: snapshot?.updatedAt ?? new Date().toISOString(),
-        resetAt: snapshot?.resetAt ?? null,
-        delta: graphSnapshotDelta(payload.old_value ?? null, snapshot),
-      });
+      try {
+        await sendViewerEvent(sdk, eventId("graph", "snapshot"), "graph.changed", {
+          source: "snapshot",
+          generation: null,
+          stats: snapshot?.stats ?? null,
+          updatedAt: snapshot?.updatedAt ?? new Date().toISOString(),
+          resetAt: snapshot?.resetAt ?? null,
+          delta: graphSnapshotDelta(payload.old_value ?? null, snapshot),
+        });
+        lastGraphSnapshotEventAt = Date.now();
+      } catch (error) {
+        lastGraphSnapshotEventAt = Number.NEGATIVE_INFINITY;
+        throw error;
+      }
       return { emitted: true };
     }),
   );
@@ -267,16 +286,41 @@ export function registerViewerStreamTriggers(
       pendingGraphItems.nodes = 0;
       pendingGraphItems.edges = 0;
     }
-    const snapshot = await kv.get<GraphSnapshot>(KV.graphSnapshot, GRAPH_SNAPSHOT_KEY);
+    let current: Awaited<ReturnType<typeof readGenerationSnapshot>>;
+    try {
+      current = await readGenerationSnapshot();
+    } catch (error) {
+      invalidateViewerCounts();
+      lastGraphSnapshotEventAt = Number.NEGATIVE_INFINITY;
+      await sendViewerEvent(sdk, eventId("graph", "invalidation"), "graph.changed", {
+        source: "items",
+        coveredBySnapshot: false,
+        ...(kind === "reset" ? { reset: true } : {}),
+        updatedAt: new Date().toISOString(),
+      }).catch(() => {});
+      throw error;
+    }
+    const { generation, snapshot } = current;
+    const reset = kind === "reset" || (lastGenerationSnapshot !== null && lastGenerationSnapshot.generation !== generation);
+    const before = !reset && lastGenerationSnapshot?.generation === generation ? lastGenerationSnapshot.snapshot : null;
+    const nextBaseline = { generation, snapshot: structuredClone(snapshot) };
     noteGraphStats(snapshot?.stats ?? { totalNodes: 0, totalEdges: 0, nodesByType: {}, edgesByType: {} });
-    lastGraphSnapshotEventAt = Date.now();
-    await sendViewerEvent(sdk, eventId("graph", "snapshot"), "graph.changed", {
-      source: "snapshot",
-      stats: snapshot?.stats ?? null,
-      updatedAt: snapshot?.updatedAt ?? new Date().toISOString(),
-      resetAt: snapshot?.resetAt ?? null,
-      delta: graphSnapshotDelta(null, snapshot),
-    });
+    try {
+      await sendViewerEvent(sdk, eventId("graph", "snapshot"), "graph.changed", {
+        source: "snapshot",
+        generation,
+        reset,
+        stats: snapshot?.stats ?? null,
+        updatedAt: snapshot?.updatedAt ?? new Date().toISOString(),
+        resetAt: snapshot?.resetAt ?? null,
+        delta: graphSnapshotDelta(before, snapshot),
+      });
+      lastGraphSnapshotEventAt = Date.now();
+      lastGenerationSnapshot = nextBaseline;
+    } catch (error) {
+      lastGraphSnapshotEventAt = Number.NEGATIVE_INFINITY;
+      throw error;
+    }
   }));
 
   sdk.registerFunction(
@@ -328,7 +372,7 @@ export function registerViewerStreamTriggers(
       if (authErr) return authErr;
       const [health, graph, lastRun] = await Promise.all([
         getLatestHealth(kv).catch(() => null),
-        kv.get<GraphSnapshot>(KV.graphSnapshot, GRAPH_SNAPSHOT_KEY).catch(() => null),
+        readGenerationSnapshot().catch(() => null),
         kv.get<ConsolidationRunRecord>(KV.config, CONSOLIDATION_LAST_RUN_KEY).catch(() => null),
       ]);
       return {
@@ -343,8 +387,8 @@ export function registerViewerStreamTriggers(
           provider: detectLlmProviderKind(),
           embeddingProvider: getEmbeddingProvider()?.name ?? "none",
           flags: buildConfigFlags(),
-          graph: graph
-            ? { stats: graph.stats, updatedAt: graph.updatedAt, resetAt: graph.resetAt ?? null }
+          graph: graph?.snapshot
+            ? { stats: graph.snapshot.stats, updatedAt: graph.snapshot.updatedAt, resetAt: graph.snapshot.resetAt ?? null, generation: graph.generation }
             : null,
           consolidation: {
             lastRun: lastRun ?? null,
